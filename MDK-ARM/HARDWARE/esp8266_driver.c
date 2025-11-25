@@ -688,57 +688,85 @@ void Cleanup_Old_Car_Info(void)
 // 处理ESP8266接收数据 - 最终简化版本
 void ESP8266_Process(void)
 {
+    // 1. 检查是否有数据
     if(esp8266_rx_index == 0) return;
     
-    // 添加结束符
-    esp8266_rx_buffer[esp8266_rx_index] = '\0';
-    
-    char* data_start = (char*)esp8266_rx_buffer;
+    // 2. 确保缓冲区以空字符结束，方便字符串操作
+    uint8_t* data_start = esp8266_rx_buffer;
     uint32_t data_length = esp8266_rx_index;
+    if(data_length < sizeof(esp8266_rx_buffer)) {
+        data_start[data_length] = '\0';
+    } else {
+        // 缓冲区溢出保护，将最后一个字符置为0
+        data_start[sizeof(esp8266_rx_buffer) - 1] = '\0';
+    }
     
-    // 统一处理所有+IPD包
-    char* current_ptr = data_start;
-    int processed_count = 0;
+    char* current_ptr = (char*)data_start;
+    char* last_processed_ptr = (char*)data_start; // 记录处理到的位置
     
-    while((current_ptr = strstr(current_ptr, "+IPD")) != NULL && processed_count < 10) {
-        // 快速解析+IPD格式
-        char* comma1 = strchr(current_ptr, ',');
-        if(!comma1) break;
+    // 3. 循环查找并处理完整的 +IPD 包
+    while((current_ptr = strstr(current_ptr, "+IPD")) != NULL) {
         
+        // 查找包头中的第一个逗号
+        char* comma1 = strchr(current_ptr, ',');
+        if(!comma1) break; 
+        
+        // 查找长度字段前的第二个逗号
         char* comma2 = strchr(comma1 + 1, ',');
         if(!comma2) break;
         
+        // 查找数据起始的冒号
         char* colon = strchr(comma2 + 1, ':');
-        if(!colon) break;
+        if(!colon) break; 
         
-        // 手动解析连接ID和数据长度
-        int link_id = atoi(comma1 + 1);
+        // 解析长度（这是关键）
         int data_len = atoi(comma2 + 1);
-        char* packet_data = colon + 1;
         
-        // 确保数据长度有效
-        if(data_len > 0 && data_len < 500 && 
-           (packet_data + data_len) <= (data_start + data_length)) {
-            
-            // 统一处理所有数据类型
-            Process_All_Data_Types(packet_data, data_len, link_id);
+        // 计算这个包的实际结束位置：冒号 + 1 + 数据长度
+        char* packet_data_start = colon + 1;
+        char* packet_end = packet_data_start + data_len;
+        
+        // 4. 【核心判断】：检查数据是否完整（防止断包）
+        // 必须确保数据包的结束位置在当前接收到的数据范围之内
+        if ((uint8_t*)packet_end > (data_start + data_length)) {
+            // 数据还没收完，这是残余数据（断包），跳出循环，保留数据
+            break; 
         }
         
-        current_ptr = packet_data + data_len;
-        processed_count++;
+        // 5. 数据完整，进行处理
+        // 从 packet_data_start 开始，长度为 data_len 的数据是完整的 payload
+        int link_id = atoi(comma1 + 1);
+        Process_All_Data_Types(packet_data_start, data_len, link_id);
+        
+        // 6. 更新指针，指向下一个可能的位置
+        current_ptr = packet_end;
+        last_processed_ptr = packet_end;
     }
     
-    // 立即清空缓冲区
-    esp8266_rx_index = 0;
+    // 7. 【残余数据处理】：移动残余数据到缓冲区头部
+    uint32_t processed_len = (uint8_t*)last_processed_ptr - data_start;
+    uint32_t remaining_len = data_length - processed_len;
     
-    // 定期清理过时信息
-    static uint32_t last_cleanup_time = 0;
-    uint32_t current_time = HAL_GetTick();
-    if (current_time - last_cleanup_time > 10000) {
-        Cleanup_Old_Car_Info();
-        last_cleanup_time = current_time;
+    if (remaining_len > 0 && processed_len > 0) {
+        // 将剩下的不完整数据（残余数据）搬到开头
+        memmove(data_start, last_processed_ptr, remaining_len);
+        esp8266_rx_index = remaining_len; // 更新索引
+        // debug_print("[IPD处理] 发现残余数据，保留并等待下一批\r\n");
+    } else if (remaining_len == 0) {
+        // 全部处理干净了
+        esp8266_rx_index = 0;
+    } else {
+        // processed_len == 0，说明连一个完整的 +IPD 包都没凑齐
+        // 可能是等待第一个包，或者缓冲区已满。不移动，继续接收。
+        
+        // 溢出保护：如果缓冲区快满了（例如只剩50字节），但还找不到一个完整包，强制清空，避免死锁。
+        if(esp8266_rx_index >= sizeof(esp8266_rx_buffer) - 50) {
+            // debug_print("[IPD处理] 缓冲区即将溢出，强制清空脏数据\r\n");
+            esp8266_rx_index = 0;
+        }
     }
 }
+
 
 // 处理广播小车数据格式数据（新格式：去掉电压数据）
 void Process_Compact_Broadcast(const char* data)
